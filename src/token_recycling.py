@@ -1,7 +1,9 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.cache_utils import DynamicCache
 import sys
-from typing import Callable, TypeVar, List, Optional
+from typing import Callable, TypeVar, List, Tuple, Optional
+import time
 
 from dataclasses import dataclass
 
@@ -46,6 +48,7 @@ class TokenRecycling:
             device=self.device
         )
         self.should_speculate = True
+        self.use_cache = True # Use a KV cache.
         self.show_tokens = False # Print token IDs instead of decoding.
 
         # For this template, the root is the last verified token. We don't verify it but keep
@@ -68,6 +71,9 @@ class TokenRecycling:
         guess_length = 0 # Number of trailing tokens in input_ids that are guesses.
         total_accepted_tokens = 0
         total_guesses = 0
+        past_key_values: Optional[DynamicCache] = DynamicCache() if self.use_cache else None
+        prompt_start_time = time.time()
+        generation_start_time = None
 
         if hot_start and self.should_speculate:
             # TODO: Seed an initial guess.
@@ -75,19 +81,36 @@ class TokenRecycling:
 
         while input_ids.shape[-1] - prompt_length - guess_length < max_new_tokens:
             with torch.no_grad():
-                position_ids = self.get_position_ids(input_ids, guess_length)
-                attention_mask = self.get_attention_mask(input_ids, guess_length)
+                with signposter.use_interval("position_ids", "end"):
+                    position_ids = self.get_position_ids(input_ids, guess_length)
+                with signposter.use_interval("attention_mask", "end"):
+                    attention_mask = self.get_attention_mask(input_ids, guess_length)
+                use_full_input_ids = not self.use_cache or input_ids.shape[-1] == prompt_length
                 with signposter.use_interval("forward", "end"):
-                    logits = self.model(input_ids, position_ids=position_ids, attention_mask=attention_mask).logits
+                    logits = self.model(
+                        input_ids if use_full_input_ids else input_ids[..., -(guess_length+1):],
+                        position_ids=position_ids if use_full_input_ids or position_ids is None else position_ids[..., -(guess_length+1):],
+                        attention_mask=attention_mask if use_full_input_ids or attention_mask is None else attention_mask[..., -(guess_length+1):, :],
+                        past_key_values=past_key_values,
+                        use_cache=self.use_cache,
+                    ).logits
 
+            if guess_length > 0:
+                total_guesses += 1
+            if generation_start_time is None:
+                generation_start_time = time.time()
+
+            sp = signposter.begin_interval("update matrix")
             next_token_index = -1 - guess_length
             if not hot_start:
                 # Initialize from the entire prompt if cold-starting.
-                self.adjacency_matrix[input_ids] = logits.topk(Config.matrix_top_k).indices
-                self.hot_start = True
+                self.adjacency_matrix[input_ids if use_full_input_ids else input_ids[..., -(guess_length+1):]] = logits.topk(Config.matrix_top_k).indices
+                hot_start = True
             else:
-                # Only update newest token.
-                self.adjacency_matrix[input_ids[:, next_token_index]] = logits[:, next_token_index, :].topk(Config.matrix_top_k).indices
+                # Update the newest token and any guess tokens. Including guess tokens increases MAT.
+                update_slice = next_token_index if guess_length == 0 else slice(next_token_index, None)
+                self.adjacency_matrix[input_ids[:, update_slice]] = logits[:, update_slice, :].topk(Config.matrix_top_k).indices
+            sp = sp("end")
 
             next_token = logits[:, next_token_index, :].argmax(dim=-1)
 
@@ -96,21 +119,25 @@ class TokenRecycling:
 
             if self.should_speculate:
                 # Split inputs from guesses.
-                input_length = input_ids.shape[-1] - guess_length # Avoid slicing when guess_length is 0.
+                input_length = input_ids.shape[-1] - guess_length # Avoid negative slicing when guess_length is 0.
                 assert input_ids.shape[-1]  + next_token_index == input_length-1, f"Next token index {next_token_index} does not align with input length {input_length}"
                 guesses = input_ids[..., input_length:]
                 input_ids = torch.cat([input_ids[... , :input_length], next_token.unsqueeze(0)], dim=-1)
 
                 # Get correct guesses, if any.
                 if guess_length > 0:
-                    # TODO: Can we add the final logit in some cases?
-                    guess_max = logits[..., input_length-1:-1, :].argmax(dim=-1) # Look back 1 to include the newly-predicted token. All guesses are predicated on it.
+                    # Look back 1 to include the newly-predicted token. All guesses are predicated on it.
+                    guess_logits = logits[..., input_length-1:, :] if use_full_input_ids else logits
+                    guess_max = guess_logits.argmax(dim=-1)
                     assert guess_max[0, 0] == next_token, f"Expected {next_token} as first part of guess but got {guess_max[0, 0]}"
-                    matches = self.matching_sequences(guesses, guess_max, self.sequences)
+                    with signposter.use_interval("matching sequences", "end"):
+                        matches = self.matching_sequences(guesses, guess_max[...,:-1], self.sequences)
+
                     if len(matches) > 0:
                         longest_sequence = max(matches, key=lambda s: s.shape[-1])
-                        assert guesses[..., longest_sequence][0, 0] == next_token, f"Expected {next_token.item()} as first part of sequence but got {guesses[..., longest_sequence][0, 0]}"
-                        verified_ids = guesses[..., longest_sequence][..., 1:] # Drop the newly-predicted token, it was already added.
+                        assert guesses[0, longest_sequence[0]] == next_token, f"Expected {next_token.item()} as first part of sequence but got {guesses[0, longest_sequence[0]]}"
+                        verified_ids = guess_max[..., longest_sequence+1]
+
                         colors = ["95", "94", "92", "93", "91"]
                         for idx, id in enumerate(verified_ids.squeeze(0)):
                             foreground = colors[idx % len(colors)]
@@ -121,25 +148,29 @@ class TokenRecycling:
                             signposter.emit_event(f"accept {verified_ids.shape[-1]}")
                             total_accepted_tokens += verified_ids.shape[-1]
                         sys.stdout.flush()
+
                         input_ids = torch.cat([input_ids, verified_ids], dim=-1)
+                        with signposter.use_interval("partition cache", "end"):
+                            past_key_values, guess_caches = self.partition_cache(past_key_values, guess_length)
+                        with signposter.use_interval("update verified cache", "end"):
+                            self.update_verified_cache(past_key_values, guess_caches, longest_sequence)
+                    elif past_key_values:
+                        past_key_values.crop(input_length)
 
                 # Generate new guesses.
                 with signposter.use_interval("make guesses", "end"):
                     new_guesses = torch.tensor(self.merge_sequence(self.adjacency_matrix, self.tree_template, input_ids[..., -1]), device=self.device)[1:] # Exclude the latest known token.
                 input_ids = torch.cat([input_ids, new_guesses.unsqueeze(0)], dim=-1)
                 guess_length = new_guesses.shape[-1]
-                total_guesses += 1
             else:
                 input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=-1)
 
-
-        print(f"\n\nMean Accepted Tokens: {total_accepted_tokens / total_guesses:.2f}")
-        # merged = torch.tensor(self.merge_sequence(self.adjacency_matrix, self.tree_template, input_ids[:, input_ids.shape[-1]-guess_length]))
-        # print("Continuations:")
-        # for seq in self.tree_template.sequences():
-        #     toks = merged[seq]
-        #     print(toks)
-        #     print(self.tokenizer.decode(toks))
+        if total_guesses > 0:
+            print(f"\n\nMean Accepted Tokens: {total_accepted_tokens / total_guesses:.2f}")
+        if generation_start_time is not None:
+            end_time = time.time()
+            print(f"Prompt: {prompt_length / (generation_start_time-prompt_start_time):.2f} tokens/sec")
+            print(f"Generation: {(input_ids.shape[-1] - prompt_length - guess_length) / (end_time-generation_start_time):.2f} tokens/sec")
 
     def get_position_ids(self, input_ids, guess_length: int) -> Optional[torch.Tensor]:
         if guess_length == 0:
@@ -197,7 +228,7 @@ class TokenRecycling:
             print(f"{token:8d} | {token_str:10s} | {candidate_strs}")
 
     @classmethod
-    def matching_sequences(cls, guess_ids: torch.Tensor, actual_ids: torch.Tensor, sequences: List[torch.Tensor]):
+    def matching_sequences(cls, guess_ids: torch.Tensor, actual_ids: torch.Tensor, sequences: List[torch.Tensor]) -> List[torch.Tensor]:
         """
         Compare the guessed speculated IDs to the actual IDs from the model output
         to see if any of the sequences were fully verified.
@@ -207,6 +238,7 @@ class TokenRecycling:
         sequences: list of sequence index tensors of varying lengths
         """
         matches = []
+        # TODO: Probably faster as a depth-first search.
         for sequence in sequences:
             # The verification indices are based on the prior sequence index. See Figure 2 in the paper.
             # Start at 0 to match the predicted next token.
@@ -214,6 +246,40 @@ class TokenRecycling:
             if (guess_ids[..., sequence] == actual_ids[..., verify_indices]).all().item():
                 matches.append(sequence)
         return matches
+
+    @classmethod
+    def partition_cache(
+            cls, cache: Optional[DynamicCache], guess_length: int
+        ) -> Tuple[Optional[DynamicCache], List[Tuple[torch.Tensor, torch.Tensor]]]:
+        """
+        Crop the provided cache and return the guess portions of the cache as a list of (key, value) tuples for each layer.
+        """
+        if cache is None:
+            return None, []
+
+        guess_kvs = []
+        for k,v in zip(cache.key_cache, cache.value_cache):
+            guess_kvs.append((k[..., -guess_length:, :], v[..., -guess_length:, :]))
+
+        cache_shape = cache.key_cache[0][0].shape
+        cache.crop(cache.get_seq_length() - guess_length)
+        return cache, guess_kvs
+
+    @classmethod
+    def update_verified_cache(
+            cls, cache: Optional[DynamicCache], guess_caches: List[Tuple[torch.Tensor, torch.Tensor]], verified_indices: torch.Tensor
+        ):
+        """
+        Insert the portions from guess_caches that correspond to the verified indices into the cache.
+        guess_caches: list with one entry per model layer of (key_cache tensor, value_cache tensor)
+        """
+        if not cache:
+            return
+
+        # Would some sort of index_select be faster? Avoid partition_cache.
+
+        for layer_idx, (k, v) in enumerate(guess_caches):
+            cache.update(k[..., verified_indices, :], v[..., verified_indices, :], layer_idx)
 
     @classmethod
     def get_relative_position_ids(cls, tree):
