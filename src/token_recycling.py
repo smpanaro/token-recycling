@@ -45,6 +45,7 @@ class TokenRecycling:
 
     def __init__(self, model, tokenizer):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.dtype = model.dtype
         self.model = model.to(self.device)
         self.tokenizer = tokenizer
 
@@ -65,7 +66,7 @@ class TokenRecycling:
         self.sequences = [torch.tensor(s, dtype=torch.long, device=self.device) for s in self.get_sequences(self.tree_template)]
         # Remove the root node from each.
         self.relative_position_ids = torch.tensor(self.get_relative_position_ids(self.tree_template), dtype=torch.long, device=self.device)[1:]
-        self.tree_attention_mask = self.get_tree_attention_mask(self.tree_template).bool()[1:, 1:].unsqueeze(0).unsqueeze(0).to(self.device) # transformers wants a 4D mask.
+        self.tree_attention_mask = self.get_tree_attention_mask(self.tree_template, device=None).bool()[1:, 1:]
 
     def generate(self, prompt: Union[str, torch.LongTensor], max_new_tokens=150, hot_start=False, silent=False):
         """
@@ -179,12 +180,14 @@ class TokenRecycling:
             else:
                 input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=-1)
 
-        if total_guesses > 0 and not silent:
-            print(f"\n\nMean Accepted Tokens: {(torch.tensor([len(s) for s in accepted_seqs], dtype=torch.float).mean()):.2f}")
-        if generation_start_time is not None and not silent:
-            end_time = time.time()
-            print(f"Prompt: {prompt_length / (generation_start_time-prompt_start_time):.2f} tokens/sec")
-            print(f"Generation: {(input_ids.shape[-1] - prompt_length - guess_length) / (end_time-generation_start_time):.2f} tokens/sec")
+        if not silent:
+            print("\n")
+            if total_guesses > 0:
+                print(f"Mean Accepted Tokens: {(torch.tensor([len(s) for s in accepted_seqs], dtype=torch.float).mean()):.2f}")
+            if generation_start_time is not None:
+                end_time = time.time()
+                print(f"Prompt: {prompt_length / (generation_start_time-prompt_start_time):.2f} tokens/sec")
+                print(f"Generation: {(input_ids.shape[-1] - prompt_length - guess_length) / (end_time-generation_start_time):.2f} tokens/sec")
 
         # Clean up outputs.
         input_ids = input_ids[..., :input_ids.shape[-1]-guess_length]
@@ -218,6 +221,7 @@ class TokenRecycling:
             return None
 
         # Without KV Cache
+        # ▉: Attend
         # ┌────────────────────────────┐
         # │▉                           │
         # │▉▉▉                         │
@@ -234,10 +238,18 @@ class TokenRecycling:
         # │▉▉▉▉▉▉▉▉▉▉▉▉▉▉▉│▉▉  ▉ ▉ ▉   │
         # └───────────────┴────────────┘
 
+        # transformers expects 4D masks to be provided pre-inverted.
+        # 0: attend, large negative number: do not attend
         input_length = input_ids.shape[-1]
-        mask = torch.tril(torch.ones((input_length, input_length), dtype=torch.bool, device=self.device)).unsqueeze(0).unsqueeze(0)
-        mask[:, :, -guess_length:, -guess_length:] = self.tree_attention_mask
-        return mask
+        min_dtype = torch.finfo(self.dtype).min
+        mask = torch.full(
+            (input_length, input_length), fill_value=min_dtype, dtype=self.dtype, device=self.device
+        )
+        mask = torch.triu(mask, diagonal=1).unsqueeze(0).unsqueeze(0)
+
+        if guess_length > 0:
+            mask[:, :, -guess_length:, -guess_length:] = ((~self.tree_attention_mask.bool()) * min_dtype)
+        return mask.to(dtype=self.dtype)
 
     def print_matrix_sample(self, num_samples=10):
         """
@@ -337,7 +349,7 @@ class TokenRecycling:
         return map_breadthfirst(tree, lambda node: get_depth(node, depths))
 
     @classmethod
-    def get_tree_attention_mask(cls, tree) -> torch.Tensor:
+    def get_tree_attention_mask(cls, tree, device=None) -> torch.Tensor:
         """
         Generate a 2D attention mask based on the given tree where
         each child only attends to itself and its ancestors.
@@ -364,7 +376,7 @@ class TokenRecycling:
             node_to_index[node] = i
             node_to_parent.update({child: node for child in node.children})
 
-        mask = torch.zeros((n, n), dtype=torch.long)
+        mask = torch.zeros((n, n), dtype=torch.long, device=None)
         for i, node in enumerate(nodes):
             mask[i, i] = 1
 
