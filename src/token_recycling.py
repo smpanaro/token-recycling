@@ -1,8 +1,8 @@
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer
 from transformers.cache_utils import DynamicCache
 import sys
-from typing import Callable, TypeVar, List, Tuple, Optional, Union
+from typing import Callable, TypeVar, List, Tuple, Optional, Union, cast
 import time
 
 from dataclasses import dataclass
@@ -29,7 +29,7 @@ class Config:
 
 @dataclass
 class Outputs:
-    output_ids: torch.LongTensor
+    output_ids: torch.Tensor
     accepted_sequences: List[List[int]]
     total_steps: int
 
@@ -43,7 +43,7 @@ class TokenRecycling:
         tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
         return cls(model, tokenizer)
 
-    def __init__(self, model, tokenizer):
+    def __init__(self, model, tokenizer: PreTrainedTokenizer):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = model.dtype
         self.model = model.to(self.device)
@@ -68,11 +68,12 @@ class TokenRecycling:
         self.relative_position_ids = torch.tensor(self.get_relative_position_ids(self.tree_template), dtype=torch.long, device=self.device)[1:]
         self.tree_attention_mask = self.get_tree_attention_mask(self.tree_template, device=None).bool()[1:, 1:]
 
-    def generate(self, prompt: Union[str, torch.LongTensor], max_new_tokens=150, hot_start=False, silent=False):
+    def generate(self, prompt: Union[str, torch.Tensor], max_new_tokens=150, hot_start=False, silent=False):
         """
         Generate text using token recycling method.
         """
-        input_ids = self.tokenizer(prompt, return_tensors="pt").to(self.device).input_ids if isinstance(prompt, str) else prompt.to(device=self.device)
+        input_ids = prompt.to(device=self.device) if isinstance(prompt, torch.Tensor) else \
+             cast(torch.Tensor, self.tokenizer(prompt, return_tensors="pt").to(self.device).input_ids)
         prompt_length = input_ids.shape[-1]
         guess_length = 0 # Number of trailing tokens in input_ids that are guesses.
         total_accepted_tokens = 0
@@ -263,9 +264,8 @@ class TokenRecycling:
         non_zero_rows = (self.adjacency_matrix.sum(dim=1) != 0).nonzero().squeeze()
 
         # Print samples
-        for idx in non_zero_rows[:num_samples]:
-            token = idx.item()
-            token_str = self.tokenizer.decode([token])
+        for token in non_zero_rows[:num_samples]:
+            token_str = self.tokenizer.decode([token.item()])
             candidates = self.adjacency_matrix[token]
             candidate_strs = [self.tokenizer.decode([c.item()]) for c in candidates]
             print(f"{token:8d} | {token_str:10s} | {candidate_strs}")
