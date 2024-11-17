@@ -2,7 +2,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
 import sys
-from typing import Callable, TypeVar, List, Tuple, Optional
+from typing import Callable, TypeVar, List, Tuple, Optional, Union
 import time
 
 from dataclasses import dataclass
@@ -26,6 +26,12 @@ class Config:
     # Hardcoded to match the static tree.
     matrix_top_k: int = 8  # Number of candidate tokens to store per token
     tree_depth: int = 6    # Maximum depth of the draft tree
+
+@dataclass
+class Outputs:
+    output_ids: torch.LongTensor
+    accepted_sequences: List[List[int]]
+    total_steps: int
 
 class TokenRecycling:
     @classmethod
@@ -61,12 +67,11 @@ class TokenRecycling:
         self.relative_position_ids = torch.tensor(self.get_relative_position_ids(self.tree_template), dtype=torch.long, device=self.device)[1:]
         self.tree_attention_mask = self.get_tree_attention_mask(self.tree_template).bool()[1:, 1:].unsqueeze(0).unsqueeze(0).to(self.device) # transformers wants a 4D mask.
 
-    def generate(self, prompt: str, max_new_tokens=150, hot_start=False):
+    def generate(self, prompt: Union[str, torch.LongTensor], max_new_tokens=150, hot_start=False, silent=False):
         """
         Generate text using token recycling method.
         """
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        input_ids = inputs.input_ids
+        input_ids = self.tokenizer(prompt, return_tensors="pt").to(self.device).input_ids if isinstance(prompt, str) else prompt.to(device=self.device)
         prompt_length = input_ids.shape[-1]
         guess_length = 0 # Number of trailing tokens in input_ids that are guesses.
         total_accepted_tokens = 0
@@ -74,12 +79,18 @@ class TokenRecycling:
         past_key_values: Optional[DynamicCache] = DynamicCache() if self.use_cache else None
         prompt_start_time = time.time()
         generation_start_time = None
+        accepted_seqs = []
+        steps = 0
 
-        if hot_start and self.should_speculate:
-            # TODO: Seed an initial guess.
-            pass
+        if self.should_speculate:
+            if not hot_start:
+                self.adjacency_matrix.fill_(0)
+            else:
+                # TODO: Seed an initial guess.
+                pass
 
         while input_ids.shape[-1] - prompt_length - guess_length < max_new_tokens:
+            steps += 1
             with torch.no_grad():
                 with signposter.use_interval("position_ids", "end"):
                     position_ids = self.get_position_ids(input_ids, guess_length)
@@ -114,8 +125,9 @@ class TokenRecycling:
 
             next_token = logits[:, next_token_index, :].argmax(dim=-1)
 
-            print(next_token.item() if self.show_tokens else self.tokenizer.decode(next_token), end=" " if self.show_tokens else "")
-            sys.stdout.flush()
+            if not silent:
+                print(next_token.item() if self.show_tokens else self.tokenizer.decode(next_token), end=" " if self.show_tokens else "")
+                sys.stdout.flush()
 
             if self.should_speculate:
                 # Split inputs from guesses.
@@ -123,6 +135,7 @@ class TokenRecycling:
                 assert input_ids.shape[-1]  + next_token_index == input_length-1, f"Next token index {next_token_index} does not align with input length {input_length}"
                 guesses = input_ids[..., input_length:]
                 input_ids = torch.cat([input_ids[... , :input_length], next_token.unsqueeze(0)], dim=-1)
+                accepted_seqs.append([next_token.item()])
 
                 # Get correct guesses, if any.
                 if guess_length > 0:
@@ -138,22 +151,23 @@ class TokenRecycling:
                         assert guesses[0, longest_sequence[0]] == next_token, f"Expected {next_token.item()} as first part of sequence but got {guesses[0, longest_sequence[0]]}"
                         verified_ids = guess_max[..., longest_sequence+1]
 
-                        colors = ["95", "94", "92", "93", "91"]
-                        for idx, id in enumerate(verified_ids.squeeze(0)):
-                            foreground = colors[idx % len(colors)]
-                            ch = self.tokenizer.decode(id)
-                            underline = ";4" if ch.isspace() else ""
-                            val = id if self.show_tokens else ch
-                            print(f"\033[{foreground}{underline}m{val}\033[0m", end=" " if self.show_tokens else "")
-                            signposter.emit_event(f"accept {verified_ids.shape[-1]}")
-                            total_accepted_tokens += verified_ids.shape[-1]
-                        sys.stdout.flush()
+                        if not silent:
+                            colors = ["95", "94", "92", "93", "91"]
+                            for idx, id in enumerate(verified_ids.squeeze(0)):
+                                foreground = colors[idx % len(colors)]
+                                ch = self.tokenizer.decode(id)
+                                underline = ";4" if ch.isspace() else ""
+                                val = id if self.show_tokens else ch
+                                print(f"\033[{foreground}{underline}m{val}\033[0m", end=" " if self.show_tokens else "")
+                                signposter.emit_event(f"accept {verified_ids.shape[-1]}")
+                            sys.stdout.flush()
 
                         input_ids = torch.cat([input_ids, verified_ids], dim=-1)
                         with signposter.use_interval("partition cache", "end"):
                             past_key_values, guess_caches = self.partition_cache(past_key_values, guess_length)
                         with signposter.use_interval("update verified cache", "end"):
                             self.update_verified_cache(past_key_values, guess_caches, longest_sequence)
+                        accepted_seqs[-1].extend(longest_sequence.tolist())
                     elif past_key_values:
                         past_key_values.crop(input_length)
 
@@ -165,12 +179,29 @@ class TokenRecycling:
             else:
                 input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=-1)
 
-        if total_guesses > 0:
-            print(f"\n\nMean Accepted Tokens: {total_accepted_tokens / total_guesses:.2f}")
-        if generation_start_time is not None:
+        if total_guesses > 0 and not silent:
+            print(f"\n\nMean Accepted Tokens: {(torch.tensor([len(s) for s in accepted_seqs], dtype=torch.float).mean()):.2f}")
+        if generation_start_time is not None and not silent:
             end_time = time.time()
             print(f"Prompt: {prompt_length / (generation_start_time-prompt_start_time):.2f} tokens/sec")
             print(f"Generation: {(input_ids.shape[-1] - prompt_length - guess_length) / (end_time-generation_start_time):.2f} tokens/sec")
+
+        # Clean up outputs.
+        input_ids = input_ids[..., :input_ids.shape[-1]-guess_length]
+
+        # Strictly apply max token limit.
+        if input_ids.shape[-1] > prompt_length + max_new_tokens:
+            trim_length = input_ids.shape[-1] - prompt_length - max_new_tokens
+            input_ids = input_ids[..., :-trim_length]
+            while trim_length > 0:
+                if len(accepted_seqs[-1]) <= trim_length:
+                    trim_length -= len(accepted_seqs.pop())
+                else:
+                    accepted_seqs[-1] = accepted_seqs[-1][:-trim_length]
+                    trim_length = 0
+            assert sum([len(s) for s in accepted_seqs]) == input_ids.shape[-1] - prompt_length
+
+        return Outputs(output_ids=input_ids, accepted_sequences=accepted_seqs, total_steps=steps)
 
     def get_position_ids(self, input_ids, guess_length: int) -> Optional[torch.Tensor]:
         if guess_length == 0:
