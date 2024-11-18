@@ -275,5 +275,36 @@ class TestTokenRecycling(unittest.TestCase):
 
         self.assertTrue(torch.all(complex_mask.eq(expected_complex_mask)))
 
+    def test_get_longest_sequence(self):
+        # Figure 2 in the paper.
+        #           [guest]
+        #    [speaker]    [speak]
+        #   [at]  [for]      [ings]
+        tree = Tree("guest")
+        tree.children = [
+            Tree("speaker", [Tree("at"), Tree("for")]),
+            Tree("speak", [Tree("ings")])
+        ]
+
+        #            |- last known token + tree root
+        #            v
+        # inputs: [guest   speaker speak at for ings]
+        # preds : [speaker at      ers   a  a   :]
+        #
+        # tree index   0        1        2      3    4    5
+        # guess_ids:  [guest,   speaker, speak, at,  for, ings]
+        #             11        12       13     14   15   16
+        # actual_ids: [speaker, at,      ers,   a,   a,   :   ]
+        #              12       14       17     18   18   19
+        # expected: [1, 3]
+
+        guess_ids  = torch.tensor([[11, 12, 13, 14, 15, 16]])
+        actual_ids = torch.tensor([[12, 14, 17, 18, 18, 19]])
+
+        longest = TokenRecycling.get_longest_sequence(tree, guess_ids, actual_ids)
+        expected = torch.tensor([0, 1, 3], dtype=torch.long)
+        self.assertTrue(torch.equal(longest, expected))
+
+
 if __name__ == '__main__':
     unittest.main()

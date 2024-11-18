@@ -63,7 +63,6 @@ class TokenRecycling:
         # The next level is the predicted token -- we would get it even without speculating.
         # The 3rd level is where we start to get bonus speculated tokens.
         self.tree_template = self.static_tree()
-        self.sequences = [torch.tensor(s, dtype=torch.long, device=self.device) for s in self.get_sequences(self.tree_template)]
         # Remove the root node from each.
         self.relative_position_ids = torch.tensor(self.get_relative_position_ids(self.tree_template), dtype=torch.long, device=self.device)[1:]
         self.tree_attention_mask = self.get_tree_attention_mask(self.tree_template, device=None).bool()[1:, 1:]
@@ -135,7 +134,7 @@ class TokenRecycling:
                 # Split inputs from guesses.
                 input_length = input_ids.shape[-1] - guess_length # Avoid negative slicing when guess_length is 0.
                 assert input_ids.shape[-1]  + next_token_index == input_length-1, f"Next token index {next_token_index} does not align with input length {input_length}"
-                guesses = input_ids[..., input_length:]
+                guesses = input_ids[..., input_length-1:] # NOTE: This includes a non-guess token, the root of the tree.
                 input_ids = torch.cat([input_ids[... , :input_length], next_token.unsqueeze(0)], dim=-1)
                 accepted_seqs.append([next_token.item()])
 
@@ -145,13 +144,12 @@ class TokenRecycling:
                     guess_logits = logits[..., input_length-1:, :] if use_full_input_ids else logits
                     guess_max = guess_logits.argmax(dim=-1)
                     assert guess_max[0, 0] == next_token, f"Expected {next_token} as first part of guess but got {guess_max[0, 0]}"
-                    with signposter.use_interval("matching sequences", "end"):
-                        matches = self.matching_sequences(guesses, guess_max[...,:-1], self.sequences)
+                    with signposter.use_interval("longest sequence", "end"):
+                        longest_sequence = self.get_longest_sequence(self.tree_template, guesses, guess_max)
 
-                    if len(matches) > 0:
-                        longest_sequence = max(matches, key=lambda s: s.shape[-1])
-                        assert guesses[0, longest_sequence[0]] == next_token, f"Expected {next_token.item()} as first part of sequence but got {guesses[0, longest_sequence[0]]}"
-                        verified_ids = guess_max[..., longest_sequence+1]
+                    if len(longest_sequence) > 0:
+                        assert guesses[0, longest_sequence[1]] == next_token, f"Expected {next_token.item()} as first part of sequence but got {guesses[0, longest_sequence[0]]}"
+                        verified_ids = guess_max[..., longest_sequence[..., 1:]]
 
                         if not silent:
                             colors = ["95", "94", "92", "93", "91"]
@@ -169,7 +167,7 @@ class TokenRecycling:
                             past_key_values, guess_caches = self.partition_cache(past_key_values, guess_length)
                         with signposter.use_interval("update verified cache", "end"):
                             self.update_verified_cache(past_key_values, guess_caches, longest_sequence)
-                        accepted_seqs[-1].extend(longest_sequence.tolist())
+                        accepted_seqs[-1].extend(longest_sequence[1:].tolist())
                     elif past_key_values:
                         past_key_values.crop(input_length)
 
@@ -239,7 +237,8 @@ class TokenRecycling:
         # │▉▉▉▉▉▉▉▉▉▉▉▉▉▉▉│▉▉  ▉ ▉ ▉   │
         # └───────────────┴────────────┘
 
-        # transformers expects 4D masks to be provided pre-inverted.
+        # transformers expects 4D masks to be provided pre-inverted
+        # for some attention implementations (eg SDPA supports bool tensors too)
         # 0: attend, large negative number: do not attend
         input_length = input_ids.shape[-1]
         min_dtype = torch.finfo(self.dtype).min
@@ -271,24 +270,54 @@ class TokenRecycling:
             print(f"{token:8d} | {token_str:10s} | {candidate_strs}")
 
     @classmethod
-    def matching_sequences(cls, guess_ids: torch.Tensor, actual_ids: torch.Tensor, sequences: List[torch.Tensor]) -> List[torch.Tensor]:
+    def get_longest_sequence(cls, tree, guess_ids: torch.Tensor, actual_ids: torch.Tensor) -> torch.Tensor:
         """
         Compare the guessed speculated IDs to the actual IDs from the model output
         to see if any of the sequences were fully verified.
 
-        guess_ids: the input merged sequence [batch, guess_length]
-        actual_ids: the predicted merged sequence [batch, guess_length]
-        sequences: list of sequence index tensors of varying lengths
+        tree: the top-k tree structure
+        guess_ids: the input merged sequence [batch, guess_length+1], the tree root (not guessed) is in index 0
+        actual_ids: the predicted merged sequence [batch, guess_length+1], actual[i] corresponds to the prediction to follow guess[i]
         """
-        matches = []
-        # TODO: Probably faster as a depth-first search.
-        for sequence in sequences:
-            # The verification indices are based on the prior sequence index. See Figure 2 in the paper.
-            # Start at 0 to match the predicted next token.
-            verify_indices = [sequence[...,i-1]+1 if i > 0 else 0 for i in range(sequence.shape[-1])]
-            if (guess_ids[..., sequence] == actual_ids[..., verify_indices]).all().item():
-                matches.append(sequence)
-        return matches
+
+        def update(node, node_to_index, node_to_parent):
+            node_to_index[node] = len(node_to_index)
+            node_to_parent.update({child: node for child in node.children})
+
+        node_to_index = {}
+        node_to_parent = {}
+        map_breadthfirst(tree, lambda node: update(node, node_to_index, node_to_parent))
+
+        node_to_depth = {}
+        stack = list(reversed(tree.children)) # Skip the root node.
+        deepest = (None, -1)
+        while stack:
+            node = stack.pop()
+
+            node_depth = node_to_depth.get(node, 0)
+            node_to_depth.update({child: node_depth + 1 for child in node.children})
+
+            guess_index = node_to_index.get(node, None)
+            verify_index = node_to_index.get(node_to_parent.get(node), None)
+
+            if not torch.equal(guess_ids[...,guess_index], actual_ids[...,verify_index]):
+                # If current node is wrong, all children are too.
+                continue
+
+            if node_depth > deepest[1]:
+                deepest = (node, node_depth)
+
+            stack.extend(reversed(node.children))
+
+        longest = []
+        if deepest[0] is not None:
+            curr = deepest[0]
+            while curr is not None:
+                idx = node_to_index.get(curr)
+                curr = node_to_parent.get(curr, None)
+                longest.append(idx)
+
+        return torch.tensor(list(reversed(longest)), dtype=torch.long, device=guess_ids.device)
 
     @classmethod
     def partition_cache(
@@ -321,8 +350,9 @@ class TokenRecycling:
 
         # Would some sort of index_select be faster? Avoid partition_cache.
 
+        new_indices = verified_indices[1:] - 1
         for layer_idx, (k, v) in enumerate(guess_caches):
-            cache.update(k[..., verified_indices, :], v[..., verified_indices, :], layer_idx)
+            cache.update(k[..., new_indices, :], v[..., new_indices, :], layer_idx)
 
     @classmethod
     def get_relative_position_ids(cls, tree):
@@ -388,36 +418,6 @@ class TokenRecycling:
                 current = parent
 
         return mask
-
-    @classmethod
-    def get_sequences(cls, tree):
-        """
-        Return a list of lists, each is a token recycling sequence
-        of breadthfirst-indices which omits the root node.
-        For example, the tree:
-           A
-         ╱   ╲
-        B     C
-        │
-        D
-        Returns [[1,3],[2]] (for: [[B,D], [C]])
-        """
-        node_to_index = {}
-        map_breadthfirst(tree, lambda node: node_to_index.update({node: len(node_to_index)}))
-
-        seqs = []
-        stack = [(tree, [node_to_index[tree]])]
-
-        while stack:
-            node, current_seq = stack.pop()
-
-            if len(current_seq) > 1:
-                seqs.append([x-1 for x in current_seq[1:]])
-            for child in reversed(node.children):
-                new_seq = current_seq + [node_to_index[child]]
-                stack.append((child, new_seq))
-
-        return seqs
 
     @classmethod
     def merge_sequence(cls, M: torch.Tensor, tree, xt):
