@@ -52,7 +52,7 @@ class TokenRecycling:
         self.adjacency_matrix = torch.zeros(
             (self.tokenizer.vocab_size, Config.matrix_top_k),
             dtype=torch.long,
-            device=self.device
+            device="cpu"
         )
         self.should_speculate = True
         self.use_cache = True # Use a KV cache.
@@ -116,12 +116,12 @@ class TokenRecycling:
             next_token_index = -1 - guess_length
             if not hot_start:
                 # Initialize from the entire prompt if cold-starting.
-                self.adjacency_matrix[input_ids if use_full_input_ids else input_ids[..., -(guess_length+1):]] = logits.topk(Config.matrix_top_k).indices
+                self.adjacency_matrix[input_ids if use_full_input_ids else input_ids[..., -(guess_length+1):]] = logits.topk(Config.matrix_top_k).indices.to(self.adjacency_matrix.device)
                 hot_start = True
             else:
                 # Update the newest token and any guess tokens. Including guess tokens increases MAT.
                 update_slice = next_token_index if guess_length == 0 else slice(next_token_index, None)
-                self.adjacency_matrix[input_ids[:, update_slice]] = logits[:, update_slice, :].topk(Config.matrix_top_k).indices
+                self.adjacency_matrix[input_ids[:, update_slice]] = logits[:, update_slice, :].topk(Config.matrix_top_k).indices.to(self.adjacency_matrix.device)
             sp = sp("end")
 
             next_token = logits[:, next_token_index, :].argmax(dim=-1)
@@ -277,6 +277,9 @@ class TokenRecycling:
         guess_ids: the input merged sequence [batch, guess_length+1], the tree root (not guessed) is in index 0
         actual_ids: the predicted merged sequence [batch, guess_length+1], actual[i] corresponds to the prediction to follow guess[i]
         """
+        device = guess_ids.device
+        guess_ids = guess_ids.cpu()
+        actual_ids = actual_ids.cpu()
 
         def update(node, node_to_index, node_to_parent):
             node_to_index[node] = len(node_to_index)
@@ -315,7 +318,7 @@ class TokenRecycling:
                 curr = node_to_parent.get(curr, None)
                 longest.append(idx)
 
-        return torch.tensor(list(reversed(longest)), dtype=torch.long, device=guess_ids.device)
+        return torch.tensor(list(reversed(longest)), dtype=torch.long, device=device)
 
     @classmethod
     def update_cache(cls, cache: Optional[DynamicCache], guess_length: int, verified_indices: torch.Tensor):
@@ -412,6 +415,9 @@ class TokenRecycling:
         This is the flattened tree of guessed sequences that will be passed to the model.
         Algorithm 1: Static Tree Based BFS in the paper.
         """
+        device = xt.device
+        xt = xt.cpu()
+
         S = []  # 1: Initialize S ← ∅
         root = xt  # 2: Initialize root ← xt
         L = torch.tensor([root], dtype=torch.int, device=M.device) # 3: Initialize the current layer L ← (root)
