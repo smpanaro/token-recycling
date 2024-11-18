@@ -163,10 +163,8 @@ class TokenRecycling:
                             sys.stdout.flush()
 
                         input_ids = torch.cat([input_ids, verified_ids], dim=-1)
-                        with signposter.use_interval("partition cache", "end"):
-                            past_key_values, guess_caches = self.partition_cache(past_key_values, guess_length)
-                        with signposter.use_interval("update verified cache", "end"):
-                            self.update_verified_cache(past_key_values, guess_caches, longest_sequence)
+                        with signposter.use_interval("cache update", "end"):
+                            self.update_cache(past_key_values, guess_length, longest_sequence)
                         accepted_seqs[-1].extend(longest_sequence[1:].tolist())
                     elif past_key_values:
                         past_key_values.crop(input_length)
@@ -320,39 +318,27 @@ class TokenRecycling:
         return torch.tensor(list(reversed(longest)), dtype=torch.long, device=guess_ids.device)
 
     @classmethod
-    def partition_cache(
-            cls, cache: Optional[DynamicCache], guess_length: int
-        ) -> Tuple[Optional[DynamicCache], List[Tuple[torch.Tensor, torch.Tensor]]]:
+    def update_cache(cls, cache: Optional[DynamicCache], guess_length: int, verified_indices: torch.Tensor):
         """
-        Crop the provided cache and return the guess portions of the cache as a list of (key, value) tuples for each layer.
-        """
-        if cache is None:
-            return None, []
+        Keep the entire non-guess part of the cache and add any verified parts.
 
-        guess_kvs = []
-        for k,v in zip(cache.key_cache, cache.value_cache):
-            guess_kvs.append((k[..., -guess_length:, :], v[..., -guess_length:, :]))
-
-        cache_shape = cache.key_cache[0][0].shape
-        cache.crop(cache.get_seq_length() - guess_length)
-        return cache, guess_kvs
-
-    @classmethod
-    def update_verified_cache(
-            cls, cache: Optional[DynamicCache], guess_caches: List[Tuple[torch.Tensor, torch.Tensor]], verified_indices: torch.Tensor
-        ):
-        """
-        Insert the portions from guess_caches that correspond to the verified indices into the cache.
-        guess_caches: list with one entry per model layer of (key_cache tensor, value_cache tensor)
+        guess_length: 3
+        verified_indices: [1]
+        initial cache: [0 1 2 3 4 5 6 7 | 8 9 10]
+        updated cache: [0 1 2 3 4 5 6 7 9]
         """
         if not cache:
             return
 
-        # Would some sort of index_select be faster? Avoid partition_cache.
-
-        new_indices = verified_indices[1:] - 1
-        for layer_idx, (k, v) in enumerate(guess_caches):
-            cache.update(k[..., new_indices, :], v[..., new_indices, :], layer_idx)
+        length = cache.key_cache[0].shape[-2]
+        input_length = cache.get_seq_length() - guess_length
+        keep_indices = torch.cat([
+            torch.arange(0, input_length, device=verified_indices.device),
+            verified_indices[1:] - 1 + input_length
+        ])
+        for layer_idx, (k,v) in enumerate(zip(cache.key_cache, cache.value_cache)):
+            cache.key_cache[layer_idx] = k.index_select(-2, keep_indices)
+            cache.value_cache[layer_idx] = v.index_select(-2, keep_indices)
 
     @classmethod
     def get_relative_position_ids(cls, tree):
