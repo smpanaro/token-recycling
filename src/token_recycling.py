@@ -52,7 +52,7 @@ class TokenRecycling:
         self.adjacency_matrix = torch.zeros(
             (self.tokenizer.vocab_size, Config.matrix_top_k),
             dtype=torch.long,
-            device="cpu"
+            device=self.device
         )
         self.should_speculate = True
         self.use_cache = True # Use a KV cache.
@@ -65,7 +65,7 @@ class TokenRecycling:
         self.tree_template = self.static_tree()
         # Remove the root node from each.
         self.relative_position_ids = torch.tensor(self.get_relative_position_ids(self.tree_template), dtype=torch.long, device=self.device)[1:]
-        self.tree_attention_mask = self.get_tree_attention_mask(self.tree_template, device=None).bool()[1:, 1:]
+        self.tree_attention_mask = self.get_tree_attention_mask(self.tree_template, device=self.device).bool()[1:, 1:]
 
     def generate(self, prompt: Union[str, torch.Tensor], max_new_tokens=150, hot_start=False, silent=False):
         """
@@ -80,6 +80,7 @@ class TokenRecycling:
         past_key_values: Optional[DynamicCache] = DynamicCache() if self.use_cache else None
         prompt_start_time = time.time()
         generation_start_time = None
+        cached_tree_layers = None
         accepted_seqs = []
         steps = 0
 
@@ -171,7 +172,9 @@ class TokenRecycling:
 
                 # Generate new guesses.
                 with signposter.use_interval("make guesses", "end"):
-                    new_guesses = torch.tensor(self.merge_sequence(self.adjacency_matrix, self.tree_template, input_ids[..., -1]), device=self.device)[1:] # Exclude the latest known token.
+                    new_guesses, cached_tree_layers = self.merge_sequence(
+                        self.adjacency_matrix, self.tree_template, input_ids[..., -1], cached_tree_layers)
+                    new_guesses = new_guesses[1:] # Exclude the latest known token.
                 input_ids = torch.cat([input_ids, new_guesses.unsqueeze(0)], dim=-1)
                 guess_length = new_guesses.shape[-1]
             else:
@@ -395,7 +398,7 @@ class TokenRecycling:
             node_to_index[node] = i
             node_to_parent.update({child: node for child in node.children})
 
-        mask = torch.zeros((n, n), dtype=torch.long, device=None)
+        mask = torch.zeros((n, n), dtype=torch.long, device=device)
         for i, node in enumerate(nodes):
             mask[i, i] = 1
 
@@ -409,21 +412,21 @@ class TokenRecycling:
         return mask
 
     @classmethod
-    def merge_sequence(cls, M: torch.Tensor, tree, xt):
+    def merge_sequence(cls, M: torch.Tensor, tree, xt, cached_layer_indices: Optional[list[list[torch.Tensor]]]):
         """
         Make a merged sequence based on adjacency matrix M, static tree structure, and last prompt token xt.
         This is the flattened tree of guessed sequences that will be passed to the model.
         Algorithm 1: Static Tree Based BFS in the paper.
         """
         device = xt.device
-        xt = xt.cpu()
+        xt = xt.to(M.device)
 
         S = []  # 1: Initialize S ← ∅
         root = xt  # 2: Initialize root ← xt
-        L = torch.tensor([root], dtype=torch.int, device=M.device) # 3: Initialize the current layer L ← (root)
+        L = root.to(dtype=torch.int, device=M.device) # 3: Initialize the current layer L ← (root)
         d = 0  # 4: Initialize the current depth d ← 0
 
-        def get_all_tree_layers(tree):
+        def get_all_tree_layers(tree) -> list[list[torch.Tensor]]:
             """
             Return a 3D list. [depth][node index][len(children)]
             """
@@ -432,14 +435,15 @@ class TokenRecycling:
                 node_to_depth.update((child, depth) for child in node.children)
                 if len(layers) <= depth:
                     layers.append([])
-                layers[depth].append([child.data for child in node.children])
+                layers[depth].append(torch.tensor([child.data for child in node.children], dtype=torch.long, device=M.device))
 
             layers = [[tree.data]]
             node_to_depth = {tree: 0}
             map_breadthfirst(tree, lambda node: update_layers(node, layers, node_to_depth))
             return layers[:-1] # Drop the final empty layer.
 
-        layer_indices = get_all_tree_layers(tree)[1:] # Skip first. Pre-compute this if it's slow.
+        layer_indices = get_all_tree_layers(tree)[1:] \
+            if cached_layer_indices is None else cached_layer_indices
         tree_depth = len(layer_indices)
         while d < tree_depth:  # 5: while d < Tree.depth do
             Lnext = []  # 6: Initialize next layer Lnext ← ∅
@@ -450,7 +454,7 @@ class TokenRecycling:
 
             # 9: Extract next layer tokens from xs with Tree
             # 10: Lnext = xs[Tree[d].index]
-            Lnext = torch.cat([x[indices] for x, indices in zip(xs, layer_indices[d])])
+            Lnext = torch.cat([x.index_select(0, indices) for x, indices in zip(xs, layer_indices[d])])
 
             # 11: Concatenate S and L
             # 12: S ← (S;L)
@@ -461,7 +465,7 @@ class TokenRecycling:
             d += 1
 
         S = torch.cat(S + [L])
-        return S.tolist()  # 15: return S
+        return S.to(device), layer_indices  # 15: return S
 
     @staticmethod
     def static_tree():
