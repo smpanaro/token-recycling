@@ -23,7 +23,7 @@ python -m src.cli
 ```
 or
 ```python
-from src.model.token_recycling import TokenRecycling
+from src.token_recycling import TokenRecycling
 
 model = TokenRecycling.from_pretrained("HuggingFaceTB/SmolLM2-135M")
 output = model.generate("Your prompt here")
