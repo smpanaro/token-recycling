@@ -7,20 +7,6 @@ import time
 
 from dataclasses import dataclass
 
-try:
-    from os_signpost import Signposter
-    signposter = Signposter("com.stephenpanaro.tokenrecycling", Signposter.Category.DynamicTracing)
-    # To record an Instruments trace:
-    # xctrace record --template TraceTemplate.tracetemplate --launch -- env/bin/python -m src.cli
-except ImportError:
-    import contextlib
-    class StubSignposter:
-        def begin_interval(self, msg) -> Callable[[Optional[str]], None]: return lambda _: None
-        @contextlib.contextmanager
-        def use_interval(self, begin_msg: str, end_msg: Optional[str]=None): yield
-        def emit_event(self, msg: str): pass
-    signposter = StubSignposter()
-
 @dataclass
 class Config:
     # Hardcoded to match the static tree.
@@ -85,10 +71,11 @@ class TokenRecycling:
         total_accepted_tokens = 0
         total_guesses = 0
         past_key_values: Optional[DynamicCache] = DynamicCache() if self.use_cache else None
-        prompt_start_time = time.time()
         generation_start_time = None
         cached_tree_layers = None
         accepted_seqs = []
+
+        prompt_start_time = time.time()
         steps = 0
 
         if self.should_speculate:
@@ -100,27 +87,22 @@ class TokenRecycling:
 
         while input_ids.shape[-1] - prompt_length - guess_length < max_new_tokens:
             steps += 1
-            with torch.no_grad():
-                with signposter.use_interval("position_ids", "end"):
-                    position_ids = self.get_position_ids(input_ids, guess_length)
-                with signposter.use_interval("attention_mask", "end"):
-                    attention_mask = self.get_attention_mask(input_ids, guess_length)
-                use_full_input_ids = not self.use_cache or input_ids.shape[-1] == prompt_length
-                with signposter.use_interval("forward", "end"):
-                    logits = self.model(
-                        input_ids if use_full_input_ids else input_ids[..., -(guess_length+1):],
-                        position_ids=position_ids if use_full_input_ids or position_ids is None else position_ids[..., -(guess_length+1):],
-                        attention_mask=attention_mask if use_full_input_ids or attention_mask is None else attention_mask[..., -(guess_length+1):, :],
-                        past_key_values=past_key_values,
-                        use_cache=self.use_cache,
-                    ).logits
+            position_ids = self.get_position_ids(input_ids, guess_length)
+            attention_mask = self.get_attention_mask(input_ids, guess_length)
+            use_full_input_ids = not self.use_cache or input_ids.shape[-1] == prompt_length
+            logits = self.model(
+                input_ids if use_full_input_ids else input_ids[..., -(guess_length+1):],
+                position_ids=position_ids if use_full_input_ids or position_ids is None else position_ids[..., -(guess_length+1):],
+                attention_mask=attention_mask if use_full_input_ids or attention_mask is None else attention_mask[..., -(guess_length+1):, :],
+                past_key_values=past_key_values,
+                use_cache=self.use_cache,
+            ).logits
 
             if guess_length > 0:
                 total_guesses += 1
             if generation_start_time is None:
                 generation_start_time = time.time()
 
-            sp = signposter.begin_interval("update matrix")
             next_token_index = -1 - guess_length
             if not hot_start:
                 # Initialize from the entire prompt if cold-starting.
@@ -130,7 +112,6 @@ class TokenRecycling:
                 # Update the newest token and any guess tokens. Including guess tokens increases MAT.
                 update_slice = next_token_index if guess_length == 0 else slice(next_token_index, None)
                 self.adjacency_matrix[input_ids[:, update_slice]] = logits[:, update_slice, :].topk(Config.matrix_top_k).indices.to(self.adjacency_matrix.device)
-            sp = sp("end")
 
             next_token = logits[:, next_token_index, :].argmax(dim=-1)
 
@@ -152,8 +133,7 @@ class TokenRecycling:
                     guess_logits = logits[..., input_length-1:, :] if use_full_input_ids else logits
                     guess_max = guess_logits.argmax(dim=-1)
                     assert guess_max[0, 0] == next_token, f"Expected {next_token} as first part of guess but got {guess_max[0, 0]}"
-                    with signposter.use_interval("longest sequence", "end"):
-                        longest_sequence = self.get_longest_sequence(self.tree_template, guesses, guess_max)
+                    longest_sequence = self.get_longest_sequence(self.tree_template, guesses, guess_max)
 
                     if len(longest_sequence) > 0:
                         assert guesses[0, longest_sequence[1]] == next_token, f"Expected {next_token.item()} as first part of sequence but got {guesses[0, longest_sequence[0]]}"
@@ -167,21 +147,18 @@ class TokenRecycling:
                                 underline = ";4" if ch.isspace() else ""
                                 val = id if self.show_tokens else ch
                                 print(f"\033[{foreground}{underline}m{val}\033[0m", end=" " if self.show_tokens else "")
-                                signposter.emit_event(f"accept {verified_ids.shape[-1]}")
                             sys.stdout.flush()
 
                         input_ids = torch.cat([input_ids, verified_ids], dim=-1)
-                        with signposter.use_interval("cache update", "end"):
-                            self.update_cache(past_key_values, guess_length, longest_sequence)
+                        self.update_cache(past_key_values, guess_length, longest_sequence)
                         accepted_seqs[-1].extend(longest_sequence[1:].tolist())
                     elif past_key_values:
                         past_key_values.crop(input_length)
 
                 # Generate new guesses.
-                with signposter.use_interval("make guesses", "end"):
-                    new_guesses, cached_tree_layers = self.merge_sequence(
-                        self.adjacency_matrix, self.tree_template, input_ids[..., -1], cached_tree_layers)
-                    new_guesses = new_guesses[1:] # Exclude the latest known token.
+                new_guesses, cached_tree_layers = self.merge_sequence(
+                    self.adjacency_matrix, self.tree_template, input_ids[..., -1], cached_tree_layers)
+                new_guesses = new_guesses[1:] # Exclude the latest known token.
                 input_ids = torch.cat([input_ids, new_guesses.unsqueeze(0)], dim=-1)
                 guess_length = new_guesses.shape[-1]
             else:
