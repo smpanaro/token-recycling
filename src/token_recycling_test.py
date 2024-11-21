@@ -31,7 +31,7 @@ class TestTokenRecycling(unittest.TestCase):
         ]
 
         # Set the last prompt token
-        xt = 5
+        xt = torch.tensor([5], dtype=torch.long)
 
         #      5
         #    / | \
@@ -41,21 +41,21 @@ class TestTokenRecycling(unittest.TestCase):
         # Possible sequences: 5,6,4 and 5,3 and 5,5
 
         # Expected output sequence
-        expected_sequence = [5, 6, 3, 5, 4]
+        expected_sequence = torch.tensor([5, 6, 3, 5, 4], dtype=torch.long)
 
         # Call the merge_sequence method
-        result = TokenRecycling.merge_sequence(M, root, xt)
+        result, _ = TokenRecycling.merge_sequence(M, root, xt, None)
 
         # Assert that the result matches the expected sequence
-        self.assertEqual(result, expected_sequence)
+        self.assertTrue(torch.equal(result, expected_sequence))
 
     def test_merge_sequence_empty_tree(self):
         M = torch.tensor([[1]], dtype=torch.long)
         root = Tree(0)
-        xt = 0
+        xt = torch.tensor([0], dtype=torch.long)
 
-        result = TokenRecycling.merge_sequence(M, root, xt)
-        self.assertEqual(result, [0])
+        result, _ = TokenRecycling.merge_sequence(M, root, xt, None)
+        self.assertTrue(torch.equal(result, torch.tensor([0], dtype=torch.long)))
 
     def test_merge_sequence_large_matrix(self):
         # Create a larger adjacency matrix
@@ -70,15 +70,15 @@ class TestTokenRecycling(unittest.TestCase):
             Tree(3, [Tree(0, [Tree(1), Tree(2, [Tree(0)])])])
         ]
 
-        xt = 0
+        xt = torch.tensor([0], dtype=torch.long)
 
-        result = TokenRecycling.merge_sequence(M, root, xt)
+        result, _ = TokenRecycling.merge_sequence(M, root, xt, None)
 
         # one entry per tree node
-        self.assertEqual(13, len(result))
+        self.assertEqual(13, result.shape[-1])
 
         # first element is the root
-        self.assertEqual(result[0], xt)
+        self.assertEqual(result[0].item(), xt.item())
 
         # Check that all elements in the result are within the range of the matrix
         self.assertTrue(all(0 <= x < vocab_size for x in result))

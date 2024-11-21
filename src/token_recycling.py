@@ -50,7 +50,7 @@ class TokenRecycling:
         self.tokenizer = tokenizer
 
         self.adjacency_matrix = torch.zeros(
-            (self.tokenizer.vocab_size, Config.matrix_top_k),
+            (self.tokenizer.vocab_size+1, Config.matrix_top_k),
             dtype=torch.long,
             device=self.device
         )
@@ -67,7 +67,14 @@ class TokenRecycling:
         self.relative_position_ids = torch.tensor(self.get_relative_position_ids(self.tree_template), dtype=torch.long, device=self.device)[1:]
         self.tree_attention_mask = self.get_tree_attention_mask(self.tree_template, device=self.device).bool()[1:, 1:]
 
-    def generate(self, prompt: Union[str, torch.Tensor], max_new_tokens=150, hot_start=False, silent=False):
+    @torch.no_grad()
+    def generate(self,
+        prompt: Union[str, torch.Tensor],
+        max_new_tokens=150,
+        hot_start=False,
+        silent=False,
+        stop_on_eos=True,
+    ):
         """
         Generate text using token recycling method.
         """
@@ -180,6 +187,10 @@ class TokenRecycling:
             else:
                 input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=-1)
 
+            if stop_on_eos and torch.where(
+                input_ids[..., prompt_length:input_ids.shape[-1]-guess_length] == self.tokenizer.eos_token_id)[-1].any():
+                    break
+
         if not silent:
             print("\n")
             if total_guesses > 0:
@@ -192,17 +203,20 @@ class TokenRecycling:
         # Clean up outputs.
         input_ids = input_ids[..., :input_ids.shape[-1]-guess_length]
 
-        # Strictly apply max token limit.
-        if input_ids.shape[-1] > prompt_length + max_new_tokens:
-            trim_length = input_ids.shape[-1] - prompt_length - max_new_tokens
+        # Strictly apply max token limit and EOS token preference.
+        eos_index = torch.where(input_ids[..., prompt_length:] == self.tokenizer.eos_token_id)[-1] + prompt_length
+        eos_index = eos_index.min().item() if stop_on_eos and eos_index.any() else input_ids.shape[-1]
+        trim_length = max(input_ids.shape[-1] - prompt_length - max_new_tokens, input_ids.shape[-1] - eos_index)
+        if trim_length > 0:
             input_ids = input_ids[..., :-trim_length]
-            while trim_length > 0:
+            while len(accepted_seqs) > 0 and trim_length > 0:
                 if len(accepted_seqs[-1]) <= trim_length:
                     trim_length -= len(accepted_seqs.pop())
                 else:
                     accepted_seqs[-1] = accepted_seqs[-1][:-trim_length]
                     trim_length = 0
             assert sum([len(s) for s in accepted_seqs]) == input_ids.shape[-1] - prompt_length
+            assert input_ids.shape[-1] <= prompt_length + max_new_tokens
 
         return Outputs(output_ids=input_ids, accepted_sequences=accepted_seqs, total_steps=steps)
 
