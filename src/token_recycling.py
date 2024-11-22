@@ -36,7 +36,7 @@ class TokenRecycling:
         self.tokenizer = tokenizer
 
         self.adjacency_matrix = torch.zeros(
-            (self.tokenizer.vocab_size+1, Config.matrix_top_k),
+            (len(self.tokenizer), Config.matrix_top_k),
             dtype=torch.long,
             device=self.device
         )
@@ -125,7 +125,7 @@ class TokenRecycling:
                 assert input_ids.shape[-1]  + next_token_index == input_length-1, f"Next token index {next_token_index} does not align with input length {input_length}"
                 guesses = input_ids[..., input_length-1:] # NOTE: This includes a non-guess token, the root of the tree.
                 input_ids = torch.cat([input_ids[... , :input_length], next_token.unsqueeze(0)], dim=-1)
-                accepted_seqs.append([next_token.item()])
+                accepted_seqs.append([0])
 
                 # Get correct guesses, if any.
                 if guess_length > 0:
